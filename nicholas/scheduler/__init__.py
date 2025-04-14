@@ -7,4 +7,4 @@ class Optimizer(Optimizer):
         super().__init__(tasks, members, ot_hours)
 
     def export_schedule(self, export_location=''):
-        export_schedules(self.res, self, export_location=export_location)
+        export_schedules(self.best_solution, self, export_location=export_location)

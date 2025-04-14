@@ -1,7 +1,13 @@
-from typing import List, Tuple
+from typing import List, Tuple, Union
 from ortools.sat.python import cp_model
-from .scheduler_classes import *
+from .scheduler_classes import Task, Member, ROLE_MEMBERS, time
 from collections import defaultdict
+import pandas as pd
+import numpy as np
+
+# Dependency types
+AND_DEP = "and"  # All predecessors must complete before task can start
+OR_DEP = "or"    # At least one predecessor must complete before task can start
 
 class EnhancedSolutionCollector(cp_model.CpSolverSolutionCallback):
     def __init__(self, tasks, members, time_unit=15, max_solutions=1000, timeout_seconds=300):
@@ -15,7 +21,6 @@ class EnhancedSolutionCollector(cp_model.CpSolverSolutionCallback):
         self.members = members
         
     def OnSolutionCallback(self):
-
         # Convert to human-readable format
         solution = {} 
         for task_id, (_, start_var, end_var, _) in self.tasks.items():
@@ -52,32 +57,25 @@ class EnhancedSolutionCollector(cp_model.CpSolverSolutionCallback):
 
 class Optimizer:
     def __init__(self, tasks: List[Task], members: List[Member], ot_hours: int = 8):
+        """
+        Initializes the Optimizer class.
+
+        Args:
+            tasks (List[Task]): A list of tasks to be scheduled.
+            members (List[Member]): A list of members available to work on the tasks.
+            ot_hours (int, optional): The number of regular working hours per member before changing to a predefined OT rate. Defaults to 8.
+        """
         self.tasks = tasks
         self.members = members
         self.ot_hours = ot_hours
-        self.optimized_cost = 0
-        self.res = None
+        self.optimized_cost = np.inf
+        self.best_solution = None
 
-    def get_by_id(self, type: List, id: int):
+    def get_by_id(self, type: Union[List[Task], List[Member]], id: int):
         """Get an object by its ID."""
-        return next((obj for obj in type if obj.id == id), None)
+        return next((obj for obj in type if obj.id == id), None)  
     
-    def dependencies_violation(self, task_id, schedule_vector) -> bool:
-        """Detects dependencies violation."""
-        task = self.tasks[task_id]
-        dependencies = task.dependencies
-        # Check if the dependencies are met
-        for dep in dependencies:
-            if isinstance(dep, Tuple):
-                if not any(schedule_vector[_dep]+self.tasks[_dep].estimated_duration <= schedule_vector[task_id] for _dep in dep):
-                    return True
-            else:
-                if not schedule_vector[dep]+self.tasks[dep].estimated_duration <= schedule_vector[task_id]:
-                    return True
-        return False
-    
-    
-    def schedule_tasks(self, get_all_solutions=False, timeout = 30):
+    def schedule_tasks(self, get_all_solutions=False, timeout = 30, num_workers = 8):
         """Schedule tasks using CP-SAT solver."""
         model = cp_model.CpModel()
         
@@ -94,7 +92,7 @@ class Optimizer:
                     if isinstance(dep, tuple):
                         dependencies.append({
                             "successor": task.id,
-                            "predecessors": list(dep),
+                            "predecessors": dep,
                             "type": OR_DEP
                         })
                     else:
@@ -112,7 +110,7 @@ class Optimizer:
             if not task.time_of_day:
                 model.Add(end_var == start_var + int(task.estimated_duration/15))
             else:
-                task_windows = [(int(time_to_minutes(s)/15), int(time_to_minutes(e)/15)) for s,e in task.time_of_day]
+                task_windows = [(int(self._time_to_minutes(s)/15), int(self._time_to_minutes(e)/15)) for s,e in task.time_of_day]
                 window_constraints = []
                 for window_start, window_end in task_windows:
                     in_window = model.NewBoolVar(f'task{task.id}_in_window_{window_start}')
@@ -180,18 +178,16 @@ class Optimizer:
             successor_id = dep["successor"]
             predecessor_ids = dep["predecessors"]
             dep_type = dep["type"]
-            
-            succ_start = task_dict[successor_id][1]
-            
+            successor_start = task_dict[successor_id][1]
+                        
             if dep_type == AND_DEP:
                 for pred_id in predecessor_ids:
-                    model.Add(succ_start >= task_dict[pred_id][2])
-                    
+                    model.Add(successor_start >= task_dict[pred_id][2])
             elif dep_type == OR_DEP:
                 or_constraints = []
                 for pred_id in predecessor_ids:
                     or_condition = model.NewBoolVar(f'pred_{pred_id}before_succ{successor_id}')
-                    model.Add(succ_start >= task_dict[pred_id][2]).OnlyEnforceIf(or_condition)
+                    model.Add(successor_start >= task_dict[pred_id][2]).OnlyEnforceIf(or_condition)
                     or_constraints.append(or_condition)
                 model.AddAtLeastOne(or_constraints)
 
@@ -200,13 +196,12 @@ class Optimizer:
         model.Minimize(total_cost)
         
         # Solve and process results
-        return self._solve_and_process_results(model, task_dict, return_solutions_only=get_all_solutions, timeout=timeout)
-    
+        return self._solve_and_process_results(model, task_dict, return_solutions_only=get_all_solutions, timeout=timeout, num_workers=num_workers)
 
     def _add_blocked_time_constraints(self, model, member, start_var, end_var, presence_var):
         """Helper method to add blocked time constraints for a member"""
         member_blocked_timeslot = [
-            (int(time_to_minutes(s)/15), int(time_to_minutes(e)/15)) 
+            (int(self._time_to_minutes(s)/15), int(self._time_to_minutes(e)/15)) 
             for s, e in member.blocked_timeslots
         ]
         
@@ -244,7 +239,6 @@ class Optimizer:
             # Create conditional time span
             time_span = model.NewIntVar(0, int(1440/15), f'time_span_{member_id}')
             model.Add(time_span == latest_end - earliest_start)
-            # model.Add(time_span == 0).OnlyEnforceIf(has_tasks.Not())
             
             # Improved overtime calculation
             regular_hours = int(self.ot_hours * 60/15)
@@ -261,15 +255,16 @@ class Optimizer:
             ot_rate = int(member.ot * 15/60)
             model.Add(member_cost == regular_time* rate + overtime* ot_rate)
             total_cost += member_cost
-        
         return total_cost
 
-    def _solve_and_process_results(self, model, task_dict, return_solutions_only=False, timeout=30):
+    def _solve_and_process_results(self, model, task_dict, return_solutions_only=False, timeout=30, num_workers=8):
         """Process solving results and return schedule"""
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = timeout
+        solver.parameters.num_search_workers = num_workers
+        
+        # This will return all solutions found before timeout
         if return_solutions_only:
-
             collector = EnhancedSolutionCollector(
                 tasks=task_dict,
                 members=self.members,
@@ -284,16 +279,16 @@ class Optimizer:
                 print('Status')
                 print(f'Found {collector.solution_count} solutions in {timeout:.2f} seconds')
                 solutions = collector.get_solutions()
-                self.res = solutions
+                self.best_solution = solutions
                 return solutions
             
         status = solver.Solve(model)
-        
         print(status)
-        if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+
+        if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
             # Build schedule
             solution = {}
-            for task_id, (_, start_var, end_var, _) in task_dict.items():
+            for task_id, (_, start_var, _, _) in task_dict.items():
                 start = solver.Value(start_var) * 15
                 solution[task_id] = start
             
@@ -309,12 +304,15 @@ class Optimizer:
                             'start': self._minutes_to_time(start),
                             'end': self._minutes_to_time(end)
                         })
+                        
             self.optimized_cost = solver.ObjectiveValue()
-            self.res = [(solution, sol_member_schedule)]
-            return [(solution, sol_member_schedule)]
-        else:
-            return None, None
+            self.best_solution = [(solution, sol_member_schedule)]
+            return best_solution
         
     def _minutes_to_time(self, minutes):
         """Convert minutes since midnight to HH:MM format"""
         return f"{minutes//60:02d}:{minutes%60:02d}"
+    
+    def _time_to_minutes(self, t: time) -> int:
+      """Convert time object to minutes since midnight."""
+      return t.hour * 60 + t.minute    
