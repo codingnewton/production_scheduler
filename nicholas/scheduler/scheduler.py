@@ -307,7 +307,7 @@ class Optimizer:
                         
             self.optimized_cost = solver.ObjectiveValue()
             self.best_solution = [(solution, sol_member_schedule)]
-            return best_solution
+            return self.best_solution
         
     def _minutes_to_time(self, minutes):
         """Convert minutes since midnight to HH:MM format"""
