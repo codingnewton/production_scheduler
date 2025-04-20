@@ -1,5 +1,5 @@
 from .scheduler import Optimizer, List
-from .scheduler_classes import Member, Task, ROLE_NAME, LOCATIONS, TRANSPORTATION_TIME
+from .scheduler_classes import Member, Task, ROLE_NAME
 from .export_schedules import export_schedules
 
 class Optimizer(Optimizer):
