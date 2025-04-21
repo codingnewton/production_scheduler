@@ -75,7 +75,7 @@ class Optimizer:
         """Get an object by its ID."""
         return next((obj for obj in type if obj.id == id), None)  
     
-    def schedule_tasks(self, get_all_solutions=False, timeout = 30, num_workers = 8):
+    def schedule_tasks(self, get_all_solutions=False, timeout = 30, num_workers = 8, break_duration = 30, max_time_before_break = 240):
         """Schedule tasks using CP-SAT solver."""
         model = cp_model.CpModel()
         
@@ -167,12 +167,6 @@ class Optimizer:
                 member = self.get_by_id(self.members, member_id)
                 self._add_blocked_time_constraints(model, member, start_var, end_var, assign_var)
 
-        # Add no-overlap constraints per member
-        for member_id, intervals in member_intervals.items():
-            model.AddNoOverlap([interval[1] for interval in intervals])
-            member = self.get_by_id(self.members, member_id)
-            member.assigned_tasks = intervals
-
         # Handle dependencies
         for dep in dependencies:
             successor_id = dep["successor"]
@@ -191,6 +185,58 @@ class Optimizer:
                     or_constraints.append(or_condition)
                 model.AddAtLeastOne(or_constraints)
 
+        # Add break constraints for each member
+        for member_id, intervals in member_intervals.items():
+            if not intervals:
+                continue
+            
+            member = self.get_by_id(self.members, member_id)
+            member.assigned_tasks = intervals            
+            member_intervals_list = [interval[1] for interval in intervals]
+            
+            
+            # Create a break interval for the member
+            # Calculate total duration of assigned tasks
+            total_duration = model.NewIntVar(0, int(1440/15), f'total_duration_{member_id}')
+            model.Add(total_duration == sum(interval[1].SizeExpr() for interval in intervals))
+
+            # Calculate number of breaks needed
+            max_time_slots = int(max_time_before_break/15)  # Convert to 15-min slots
+            break_duration_slots = int(break_duration/15)
+
+            # Create break intervals based on total duration
+            break_intervals = []
+            for i in range(int(1440/max_time_before_break)):  # Maximum possible breaks in a day
+                # Create a boolean to determine if this break is needed
+                need_break = model.NewBoolVar(f'need_break_{member_id}_{i}')
+                
+                # This break is needed if total duration > max_time_before_break * (i+1)
+                model.Add(total_duration > max_time_slots * (i+1)).OnlyEnforceIf(need_break)
+                model.Add(total_duration <= max_time_slots * (i+1)).OnlyEnforceIf(need_break.Not())
+
+                break_start = model.NewIntVar(0, int(1440/15), f'break_start_{member_id}_{i}')
+                break_end = model.NewIntVar(0, int(1440/15), f'break_end_{member_id}_{i}')
+                
+                # Break must start after minimum time but before maximum allowed time
+                min_start = max_time_slots * (i+1) - int(15/15)  # 15 minutes before max time
+                max_start = max_time_slots * (i+1) + int(45/15)  # 75 minutes after max time
+                
+                model.Add(break_start >= min_start).OnlyEnforceIf(need_break)
+                model.Add(break_start <= max_start).OnlyEnforceIf(need_break)
+                
+                break_interval = model.NewOptionalIntervalVar(
+                    break_start,
+                    break_duration_slots,
+                    break_end,
+                    need_break,
+                    f'break_interval_{member_id}_{i}'
+                )
+                break_intervals.append(break_interval)
+
+            # Add breaks to member's intervals to prevent overlap
+            all_intervals = member_intervals_list + break_intervals
+            model.AddNoOverlap(all_intervals)
+                    
         # Optimized cost calculation
         total_cost = self._calculate_costs(model, member_intervals)
         model.Minimize(total_cost)
