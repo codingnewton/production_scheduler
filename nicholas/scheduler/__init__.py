@@ -7,4 +7,8 @@ class Optimizer(Optimizer):
         super().__init__(tasks, members, ot_hours)
 
     def export_schedule(self, export_location=''):
+        """Export the best solution to a file or location."""
+        if not self.best_solution:
+            print("No solution found.")
+            return
         export_schedules(self.best_solution, self, export_location=export_location)

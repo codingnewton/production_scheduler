@@ -75,7 +75,7 @@ class Optimizer:
         """Get an object by its ID."""
         return next((obj for obj in type if obj.id == id), None)  
     
-    def schedule_tasks(self, get_all_solutions=False, timeout = 30, num_workers = 8, break_duration = 30, max_time_before_break = 240):
+    def schedule_tasks(self, get_all_solutions=False, timeout = 30, num_workers = 8, break_duration = 30, max_time_before_break = 240, allow_breaks=True):
         """Schedule tasks using CP-SAT solver."""
         model = cp_model.CpModel()
         
@@ -194,7 +194,6 @@ class Optimizer:
             member.assigned_tasks = intervals            
             member_intervals_list = [interval[1] for interval in intervals]
             
-            
             # Create a break interval for the member
             # Calculate total duration of assigned tasks
             total_duration = model.NewIntVar(0, int(1440/15), f'total_duration_{member_id}')
@@ -206,32 +205,34 @@ class Optimizer:
 
             # Create break intervals based on total duration
             break_intervals = []
-            for i in range(int(1440/max_time_before_break)):  # Maximum possible breaks in a day
-                # Create a boolean to determine if this break is needed
-                need_break = model.NewBoolVar(f'need_break_{member_id}_{i}')
-                
-                # This break is needed if total duration > max_time_before_break * (i+1)
-                model.Add(total_duration > max_time_slots * (i+1)).OnlyEnforceIf(need_break)
-                model.Add(total_duration <= max_time_slots * (i+1)).OnlyEnforceIf(need_break.Not())
+            
+            if allow_breaks:
+                for i in range(int(1440/max_time_before_break)):  # Maximum possible breaks in a day
+                    # Create a boolean to determine if this break is needed
+                    need_break = model.NewBoolVar(f'need_break_{member_id}_{i}')
+                    
+                    # This break is needed if total duration > max_time_before_break * (i+1)
+                    model.Add(total_duration >= max_time_slots * (i+1)).OnlyEnforceIf(need_break)
+                    model.Add(total_duration < max_time_slots * (i+1)).OnlyEnforceIf(need_break.Not())
 
-                break_start = model.NewIntVar(0, int(1440/15), f'break_start_{member_id}_{i}')
-                break_end = model.NewIntVar(0, int(1440/15), f'break_end_{member_id}_{i}')
-                
-                # Break must start after minimum time but before maximum allowed time
-                min_start = max_time_slots * (i+1) - int(15/15)  # 15 minutes before max time
-                max_start = max_time_slots * (i+1) + int(45/15)  # 75 minutes after max time
-                
-                model.Add(break_start >= min_start).OnlyEnforceIf(need_break)
-                model.Add(break_start <= max_start).OnlyEnforceIf(need_break)
-                
-                break_interval = model.NewOptionalIntervalVar(
-                    break_start,
-                    break_duration_slots,
-                    break_end,
-                    need_break,
-                    f'break_interval_{member_id}_{i}'
-                )
-                break_intervals.append(break_interval)
+                    break_start = model.NewIntVar(0, int(1440/15), f'break_start_{member_id}_{i}')
+                    break_end = model.NewIntVar(0, int(1440/15), f'break_end_{member_id}_{i}')
+                    
+                    # Break must start after minimum time but before maximum allowed time
+                    min_start = max_time_slots * (i+1) - int(60/15)  # 60 minutes before max time
+                    max_start = max_time_slots * (i+1) + int(60/15)  # 60 minutes after max time
+                    
+                    model.Add(break_start >= min_start).OnlyEnforceIf(need_break)
+                    model.Add(break_start <= max_start).OnlyEnforceIf(need_break)
+                    
+                    break_interval = model.NewOptionalIntervalVar(
+                        break_start,
+                        break_duration_slots,
+                        break_end,
+                        need_break,
+                        f'break_interval_{member_id}_{i}'
+                    )
+                    break_intervals.append(break_interval)
 
             # Add breaks to member's intervals to prevent overlap
             all_intervals = member_intervals_list + break_intervals
@@ -316,7 +317,7 @@ class Optimizer:
                 members=self.members,
                 time_unit=15,
                 max_solutions=100,  # Return first 100 solutions
-                timeout_seconds=30  # Stop after 1 minute
+                timeout_seconds=timeout  # Stop after 1 minute
             )
             
             status = solver.Solve(model, collector)
@@ -353,7 +354,8 @@ class Optimizer:
                         
             self.optimized_cost = solver.ObjectiveValue()
             self.best_solution = [(solution, sol_member_schedule)]
-            return self.best_solution
+            
+        return self.best_solution
         
     def _minutes_to_time(self, minutes):
         """Convert minutes since midnight to HH:MM format"""
